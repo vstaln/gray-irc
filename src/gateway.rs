@@ -203,6 +203,14 @@ impl Daemon {
             let _ = out.send(say(reply)).await;
             return;
         }
+        if crate::busy::command(&text, "stop").is_some() {
+            let reply = match self.store.cancel_conversation(&conversation) {
+                Ok(true) => crate::busy::STOPPED,
+                _ => crate::busy::NOTHING_RUNNING,
+            };
+            let _ = out.send(say(reply.to_string())).await;
+            return;
+        }
         let steer = crate::busy::command(&text, "steer").map(str::to_string);
         if let Some(steer_text) = &steer {
             if steer_text.is_empty() {
@@ -348,14 +356,21 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(500)).await;
             return Ok(true);
         }
-        let outcome = crate::runner::run_gray(
-            &self.config,
-            &self.config_path,
-            &item.conversation,
-            &item.text,
-            None,
+        let outcome = crate::busy::cancellable(
+            crate::runner::run_gray(
+                &self.config,
+                &self.config_path,
+                &item.conversation,
+                &item.text,
+                None,
+            ),
+            || self.store.cancel_requested(&item.id).unwrap_or(false),
         )
         .await;
+        let Some(outcome) = outcome else {
+            self.store.mark_cancelled(&item.id)?;
+            return Ok(true);
+        };
         match outcome {
             Ok(answer) => {
                 // Channel replies are addressed to the sender, DMs are bare.
