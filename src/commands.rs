@@ -7,7 +7,7 @@
 //! the runner spawns turns and replies inline. `local` commands answer
 //! `local_only` server-side.
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,10 +20,14 @@ const LIST_TTL: Duration = Duration::from_secs(300);
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Commands are meant to be quick; bound a hung one anyway.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Registry rows marked `slow` get this window instead.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(120);
 /// Concurrent `gray cmd run` children across all conversations.
 const MAX_RUNS: usize = 4;
 /// Registry used until `gray cmd list` answers (older gray may lack `cmd`).
-const FALLBACK: &[&str] = &["help", "model", "usage", "new", "sessions", "cron", "skills"];
+const FALLBACK: &[&str] = &[
+    "help", "model", "usage", "new", "sessions", "cron", "skills",
+];
 
 /// Which home a command runs against (`cmd list`'s `scope` field).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +44,8 @@ struct CmdState {
     refreshing: bool,
     /// Canonical name or alias -> scope. Empty until the first fetch.
     names: BTreeMap<String, Scope>,
+    /// Names (and aliases) whose runs can outlast RUN_TIMEOUT.
+    slow: BTreeSet<String>,
 }
 
 pub struct Commands {
@@ -59,7 +65,12 @@ impl Commands {
     /// caller treats the message as a normal prompt. Never blocks: the
     /// registry is the fresh cache, a stale one, or the fallback, and a
     /// stale cache kicks a background refresh.
-    pub fn parse(self: &Arc<Self>, config: &Value, text: &str, is_dm: bool) -> Option<(String, String)> {
+    pub fn parse(
+        self: &Arc<Self>,
+        config: &Value,
+        text: &str,
+        is_dm: bool,
+    ) -> Option<(String, String)> {
         parse_prefixed(text, is_dm, &self.working(config))
     }
 
@@ -87,8 +98,9 @@ impl Commands {
             tokio::spawn(async move {
                 let listed = fetch_registry(&bin, Path::new(&home)).await;
                 if let Ok(mut st) = me.state.lock() {
-                    if let Some(names) = listed.filter(|n| !n.is_empty()) {
-                        st.names = names;
+                    if let Some(reg) = listed.filter(|r| !r.0.is_empty()) {
+                        st.names = reg.0;
+                        st.slow = reg.1;
                     }
                     st.fetched = Some(Instant::now());
                     st.refreshing = false;
@@ -111,8 +123,17 @@ impl Commands {
             .unwrap_or(Scope::Conversation)
     }
 
-    /// Run one validated command; the return value is the reply text.
-    /// Spawning mirrors the runner's child environment; nothing enqueues.
+    /// Whether the registry marks this name slow.
+    fn slow_of(&self, name: &str) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .map(|st| st.slow.contains(name))
+            .unwrap_or(false)
+    }
+
+    /// Run one validated command; the caller posts `Text` or enqueues
+    /// `Prompt` as a turn. Spawning mirrors the runner's child env.
     pub async fn run(
         &self,
         config: &Value,
@@ -120,9 +141,9 @@ impl Commands {
         conversation: &str,
         name: &str,
         args: &str,
-    ) -> String {
+    ) -> Outcome {
         let Ok(_permit) = self.permits.try_acquire() else {
-            return "Commands are busy; try again in a moment.".to_string();
+            return Outcome::Text("Commands are busy; try again in a moment.".to_string());
         };
         let scope = self.scope_of(name);
         let (home, reset) = match scope {
@@ -133,7 +154,7 @@ impl Commands {
             Scope::Conversation => {
                 let home = match ensure_home(config, config_path, conversation) {
                     Ok(h) => h,
-                    Err(e) => return e,
+                    Err(e) => return Outcome::Text(e),
                 };
                 // `new` must drop the plugin's pinned session too — gray's
                 // own pointer reset alone would leave `session.json` forcing
@@ -147,15 +168,28 @@ impl Commands {
         if !args.is_empty() {
             argv.push(args.to_string());
         }
-        match spawn_cmd(config, &home, &argv, RUN_TIMEOUT).await {
+        let timeout = if self.slow_of(name) {
+            SLOW_TIMEOUT
+        } else {
+            RUN_TIMEOUT
+        };
+        match spawn_cmd(config, &home, &argv, timeout).await {
             Ok(v) => reply_from(&v, name),
             Err(e) if reset => {
                 let _ = e;
-                "Session reset — the next message starts fresh.".to_string()
+                Outcome::Text("Session reset — the next message starts fresh.".to_string())
             }
-            Err(e) => e,
+            Err(e) => Outcome::Text(e),
         }
     }
+}
+
+/// What a `cmd run` answer becomes: reply text, or a prompt the caller
+/// queues as a turn in this conversation.
+#[derive(Debug)]
+pub enum Outcome {
+    Text(String),
+    Prompt { prompt: String, fallback: String },
 }
 
 impl Default for Commands {
@@ -210,11 +244,12 @@ pub fn parse_prefixed(
     Some((name, args.to_string()))
 }
 
-/// `cmd list` JSON -> name/alias -> scope map.
-fn registry_from(v: &Value) -> BTreeMap<String, Scope> {
+/// `cmd list` JSON -> (name/alias -> scope map, slow-name set).
+fn registry_from(v: &Value) -> (BTreeMap<String, Scope>, BTreeSet<String>) {
     let mut out = BTreeMap::new();
+    let mut slow = BTreeSet::new();
     let Some(commands) = v["result"]["commands"].as_array() else {
-        return out;
+        return (out, slow);
     };
     for c in commands {
         let scope = if c["scope"].as_str() == Some("global") {
@@ -222,16 +257,25 @@ fn registry_from(v: &Value) -> BTreeMap<String, Scope> {
         } else {
             Scope::Conversation
         };
+        let is_slow = c["slow"].as_bool().unwrap_or(false);
         if let Some(name) = c["name"].as_str() {
-            out.insert(name.to_ascii_lowercase(), scope);
+            let name = name.to_ascii_lowercase();
+            out.insert(name.clone(), scope);
+            if is_slow {
+                slow.insert(name);
+            }
         }
         if let Some(aliases) = c["aliases"].as_array() {
             for a in aliases.iter().filter_map(Value::as_str) {
-                out.entry(a.to_ascii_lowercase()).or_insert(scope);
+                let a = a.to_ascii_lowercase();
+                out.entry(a.clone()).or_insert(scope);
+                if is_slow {
+                    slow.insert(a);
+                }
             }
         }
     }
-    out
+    (out, slow)
 }
 
 fn fallback_set() -> BTreeMap<String, Scope> {
@@ -242,14 +286,22 @@ fn fallback_set() -> BTreeMap<String, Scope> {
 }
 
 /// `GRAY_HOME=<main home> gray cmd list`; errors just keep the old set.
-async fn fetch_registry(gray_bin: &str, gray_home: &Path) -> Option<BTreeMap<String, Scope>> {
+async fn fetch_registry(
+    gray_bin: &str,
+    gray_home: &Path,
+) -> Option<(BTreeMap<String, Scope>, BTreeSet<String>)> {
     if gray_bin.is_empty() {
         return None;
     }
     let config = serde_json::json!({ "gray_bin": gray_bin });
-    let v = spawn_cmd(&config, gray_home, &["cmd".into(), "list".into()], LIST_TIMEOUT)
-        .await
-        .ok()?;
+    let v = spawn_cmd(
+        &config,
+        gray_home,
+        &["cmd".into(), "list".into()],
+        LIST_TIMEOUT,
+    )
+    .await
+    .ok()?;
     if v["ok"].as_bool() == Some(true) {
         Some(registry_from(&v))
     } else {
@@ -270,11 +322,10 @@ fn ensure_home(config: &Value, config_path: &Path, conversation: &str) -> Result
     let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
     let local_cfg = home.join("config.json");
     if !local_cfg.exists() {
-        let provider: Option<Value> = std::fs::read(
-            Path::new(crate::irc::cfg_str(config, "gray_home")).join("config.json"),
-        )
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok());
+        let provider: Option<Value> =
+            std::fs::read(Path::new(crate::irc::cfg_str(config, "gray_home")).join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
         if let Some(provider) = provider {
             crate::config::atomic_json(&local_cfg, &provider)?;
         }
@@ -360,30 +411,39 @@ async fn spawn_cmd(
     })
 }
 
-/// Wire object -> reply text: `text` results verbatim, `ui` via
-/// `fallback_text`, error codes as plain sentences.
-fn reply_from(v: &Value, name: &str) -> String {
+/// Wire object -> the room action: `text` results verbatim, `ui` via
+/// `fallback_text`, `prompt` hands back a turn, error codes as plain
+/// sentences.
+fn reply_from(v: &Value, name: &str) -> Outcome {
     if v["ok"].as_bool() == Some(true) {
         let result = &v["result"];
+        if result["kind"].as_str() == Some("prompt") {
+            let prompt = result["prompt"].as_str().unwrap_or("").trim().to_string();
+            if prompt.is_empty() {
+                return Outcome::Text("gray answered an empty prompt.".to_string());
+            }
+            let fallback = result["fallback_text"].as_str().unwrap_or("").to_string();
+            return Outcome::Prompt { prompt, fallback };
+        }
         let text = match result["kind"].as_str() {
             Some("ui") => result["fallback_text"].as_str(),
             _ => result["text"].as_str(),
         };
         let text = text.unwrap_or("").trim_end();
-        if text.is_empty() {
+        Outcome::Text(if text.is_empty() {
             "Done.".to_string()
         } else {
             text.to_string()
-        }
+        })
     } else {
         let code = v["error"]["code"].as_str().unwrap_or("");
         let msg = v["error"]["message"].as_str().unwrap_or("").trim();
-        match code {
+        Outcome::Text(match code {
             "local_only" => format!("`{name}` only works in the gray TUI."),
             "unknown_command" => format!("Unknown command `{name}`."),
             _ if !msg.is_empty() => msg.to_string(),
             _ => "That command is unavailable right now.".to_string(),
-        }
+        })
     }
 }
 
@@ -471,11 +531,12 @@ mod tests {
                  "args": [], "scope": "conversation", "surface": "local"}
             ]}
         });
-        let m = registry_from(&v);
+        let (m, slow) = registry_from(&v);
         assert_eq!(m["model"], Scope::Conversation);
         assert_eq!(m["m"], Scope::Conversation);
         assert_eq!(m["plugin"], Scope::Global);
         assert_eq!(m["theme"], Scope::Conversation);
+        assert!(slow.is_empty());
         assert_eq!(
             parse_prefixed("!m gpt-5", false, &m),
             Some(("m".into(), "gpt-5".into()))
@@ -487,38 +548,59 @@ mod tests {
         let text = serde_json::json!({
             "ok": true, "result": {"kind": "text", "text": "**3** sessions", "close": true}
         });
-        assert_eq!(reply_from(&text, "sessions"), "**3** sessions");
+        match reply_from(&text, "sessions") {
+            Outcome::Text(t) => assert_eq!(t, "**3** sessions"),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let ui = serde_json::json!({
             "ok": true, "result": {"kind": "ui", "token": "t",
                 "document": {}, "fallback_text": "1. low\n2. high"}
         });
-        assert_eq!(reply_from(&ui, "model"), "1. low\n2. high");
+        match reply_from(&ui, "model") {
+            Outcome::Text(t) => assert_eq!(t, "1. low\n2. high"),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let ui_no_fallback = serde_json::json!({
             "ok": true, "result": {"kind": "ui", "token": "t", "document": {}}
         });
-        assert_eq!(reply_from(&ui_no_fallback, "model"), "Done.");
+        match reply_from(&ui_no_fallback, "model") {
+            Outcome::Text(t) => assert_eq!(t, "Done."),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let local = serde_json::json!({
             "ok": false, "error": {"code": "local_only",
                 "message": "theme is TUI-only", "retryable": false}
         });
-        assert_eq!(reply_from(&local, "theme"), "`theme` only works in the gray TUI.");
+        match reply_from(&local, "theme") {
+            Outcome::Text(t) => assert_eq!(t, "`theme` only works in the gray TUI."),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let unknown = serde_json::json!({
             "ok": false, "error": {"code": "unknown_command", "message": "?", "retryable": false}
         });
-        assert_eq!(reply_from(&unknown, "frob"), "Unknown command `frob`.");
+        match reply_from(&unknown, "frob") {
+            Outcome::Text(t) => assert_eq!(t, "Unknown command `frob`."),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let args = serde_json::json!({
             "ok": false, "error": {"code": "invalid_args",
                 "message": "usage: model <id>", "retryable": false}
         });
-        assert_eq!(reply_from(&args, "model"), "usage: model <id>");
+        match reply_from(&args, "model") {
+            Outcome::Text(t) => assert_eq!(t, "usage: model <id>"),
+            other => panic!("expected text: {other:?}"),
+        }
 
         let bare = serde_json::json!({"ok": false, "error": {}});
-        assert_eq!(reply_from(&bare, "x"), "That command is unavailable right now.");
+        match reply_from(&bare, "x") {
+            Outcome::Text(t) => assert_eq!(t, "That command is unavailable right now."),
+            other => panic!("expected text: {other:?}"),
+        }
     }
 
     /// A stand-in `gray` binary: prints one fixture object like `cmd run`.
@@ -555,7 +637,10 @@ mod tests {
         let reply = commands
             .run(&config, &config_path, "chat:#c", "help", "")
             .await;
-        assert_eq!(reply, "pong");
+        match reply {
+            Outcome::Text(t) => assert_eq!(t, "pong"),
+            other => panic!("expected text: {other:?}"),
+        }
         // The conversation home was created for the conversation-scoped run.
         let home = crate::session::conversation_home(&config_path, "chat:#c");
         assert!(home.is_dir());
@@ -573,6 +658,9 @@ mod tests {
         let reply = commands
             .run(&config, &dir.path().join("config.json"), "dm:n", "help", "")
             .await;
-        assert!(reply.contains("may not support"), "{reply}");
+        match reply {
+            Outcome::Text(t) => assert!(t.contains("may not support"), "{t}"),
+            other => panic!("expected text: {other:?}"),
+        }
     }
 }

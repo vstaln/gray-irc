@@ -201,16 +201,53 @@ impl Daemon {
             } else {
                 String::new()
             };
+            let sender = sender.to_string();
+            let conversation = conversation.clone();
             tokio::spawn(async move {
-                let reply = commands
+                match commands
                     .run(&config, &config_path, &conversation, &name, &args)
-                    .await;
-                let _ = out
-                    .send(Out::Say {
-                        target,
-                        text: format!("{mention}{reply}"),
-                    })
-                    .await;
+                    .await
+                {
+                    crate::commands::Outcome::Text(reply) => {
+                        let _ = out
+                            .send(Out::Say {
+                                target,
+                                text: format!("{mention}{reply}"),
+                            })
+                            .await;
+                    }
+                    crate::commands::Outcome::Prompt { prompt, fallback } => {
+                        let capacity = config
+                            .get("queue_capacity")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1000);
+                        let enqueued = open_store(&config_path).and_then(|s| {
+                            s.enqueue(&target, &sender, &conversation, &prompt, capacity)
+                        });
+                        match enqueued {
+                            Ok(_) => {
+                                if !fallback.trim().is_empty() {
+                                    let _ = out
+                                        .send(Out::Say {
+                                            target,
+                                            text: format!("{mention}{}", fallback.trim()),
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = out
+                                    .send(Out::Say {
+                                        target,
+                                        text: format!(
+                                            "{mention}Queue full ({e}); try again later."
+                                        ),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
             });
             return;
         }
@@ -272,7 +309,8 @@ impl Daemon {
                     let Some(out) = self.out_tx() else {
                         attempts += 1;
                         if attempts > 5 {
-                            self.store.fail(&item.id, "delivery failed: not connected")?;
+                            self.store
+                                .fail(&item.id, "delivery failed: not connected")?;
                             break;
                         }
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -294,7 +332,8 @@ impl Daemon {
                     }
                     attempts += 1;
                     if attempts > 5 {
-                        self.store.fail(&item.id, "delivery failed: connection lost")?;
+                        self.store
+                            .fail(&item.id, "delivery failed: connection lost")?;
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -430,9 +469,7 @@ async fn on_line(daemon: &Daemon, tx: &mpsc::Sender<Out>, own_nick: &mut String,
             if target.is_empty() || text.is_empty() {
                 return;
             }
-            daemon
-                .on_privmsg(tx, own_nick, &sender, target, text)
-                .await;
+            daemon.on_privmsg(tx, own_nick, &sender, target, text).await;
         }
         // Track forced nick changes so addressing stays exact.
         "NICK" => {
