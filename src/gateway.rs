@@ -65,6 +65,8 @@ struct Daemon {
     store: Store,
     /// The live connection's outbound queue; `None` while reconnecting.
     out: std::sync::Mutex<Option<mpsc::Sender<Out>>>,
+    /// `!cmd`/`/cmd` registry + runner (gray cmd, GRAY-CMD-CONTRACT).
+    commands: Arc<crate::commands::Commands>,
 }
 
 impl Daemon {
@@ -130,8 +132,12 @@ impl Daemon {
             }
         }
         let chan = is_channel(target);
+        // True only for an unaddressed channel `!…`; still gated below, and
+        // dropped rather than prompted if it parses to no known command.
+        let mut bang = false;
         if chan {
-            // In a channel the bot only answers when addressed.
+            // In a channel the bot only answers when addressed — except a
+            // `!command`, which is self-addressing by convention.
             let mut addressed = None;
             for sep in [':', ',', ' '] {
                 let prefix = format!("{own_nick}{sep}");
@@ -142,6 +148,7 @@ impl Daemon {
             }
             match addressed {
                 Some(t) if !t.is_empty() => text = t,
+                _ if text.trim_start().starts_with('!') => bang = true,
                 _ => return,
             }
         }
@@ -175,6 +182,39 @@ impl Daemon {
                     text: note.to_string(),
                 })
                 .await;
+            return;
+        }
+
+        // `!cmd`/`/cmd` headless commands answer inline via `gray cmd`;
+        // they never enqueue a turn. The reply rides the outbound queue
+        // (chunked to IRC's line limit) from a spawned task so a slow
+        // command cannot stall the read loop.
+        if let Some((name, args)) = self.commands.parse(&self.config, &text, !chan) {
+            let out = out.clone();
+            let commands = Arc::clone(&self.commands);
+            let config = self.config.clone();
+            let config_path = self.config_path.clone();
+            let conversation = conversation.clone();
+            let target = reply_target.to_string();
+            let mention = if chan {
+                format!("{sender}: ")
+            } else {
+                String::new()
+            };
+            tokio::spawn(async move {
+                let reply = commands
+                    .run(&config, &config_path, &conversation, &name, &args)
+                    .await;
+                let _ = out
+                    .send(Out::Say {
+                        target,
+                        text: format!("{mention}{reply}"),
+                    })
+                    .await;
+            });
+            return;
+        }
+        if bang {
             return;
         }
 
@@ -471,6 +511,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         config_path: config_path.to_path_buf(),
         store,
         out: std::sync::Mutex::new(None),
+        commands: Arc::new(crate::commands::Commands::new()),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted

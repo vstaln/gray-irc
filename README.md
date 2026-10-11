@@ -67,6 +67,10 @@ The service probes what this box actually supervises with (runit,
   `* nick action`.
 - Channel replies are addressed back (`younick: answer`); DMs are bare.
 - `/new` or `/reset` in a chat starts a fresh session.
+- `!<cmd> args` in a channel or `/<cmd> args` (bare `<cmd>` too) in DM runs
+  a headless `gray cmd` command — `!help`, `!model`, `!usage`, `!new`,
+  `!sessions`, `!cron`, `!skills`. Answers come back as plain text and
+  never spend a model turn.
 - A DM from a nick that is not allowlisted gets a one-shot pairing code;
   the owner approves it with `gray irc pairing approve irc <CODE>`.
   Nicks are claimed, not authenticated — treat a paired nick as whoever

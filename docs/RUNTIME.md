@@ -24,6 +24,11 @@ notices and QUITs.
 - Session reset policy `session_reset` (`both`: 1,440 idle minutes or the
   next 04:00 local boundary) mirrors the other adapters; `/new` and
   `/reset` force it early.
+- `!name args` in a channel (no addressing needed) and `/name args`,
+  `!name args`, or a bare single `name` in DM dispatch to `gray cmd run`
+  in that conversation's home (GRAY-CMD-CONTRACT). `kind:"ui"` answers
+  render through `fallback_text`; an unknown name falls back to a normal
+  prompt. Commands spawn off the read loop and never enqueue a turn.
 
 ## Queue
 
