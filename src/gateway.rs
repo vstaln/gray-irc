@@ -67,6 +67,8 @@ struct Daemon {
     out: std::sync::Mutex<Option<mpsc::Sender<Out>>>,
     /// `!cmd`/`/cmd` registry + runner (gray cmd, GRAY-CMD-CONTRACT).
     commands: Arc<crate::commands::Commands>,
+    acks: crate::busy::Acks,
+    pager: Arc<crate::busy::Pager>,
 }
 
 impl Daemon {
@@ -185,13 +187,46 @@ impl Daemon {
             return;
         }
 
+        let mention = if chan {
+            format!("{sender}: ")
+        } else {
+            String::new()
+        };
+        let say = |text: String| Out::Say {
+            target: reply_target.to_string(),
+            text: format!("{mention}{text}"),
+        };
+        if let Some(args) = crate::busy::command(&text, "page") {
+            let reply = self
+                .pager
+                .page(&conversation, crate::busy::page_number(args));
+            let _ = out.send(say(reply)).await;
+            return;
+        }
+        let steer = crate::busy::command(&text, "steer").map(str::to_string);
+        if let Some(steer_text) = &steer {
+            if steer_text.is_empty() {
+                let _ = out.send(say(crate::busy::STEER_USAGE.to_string())).await;
+                return;
+            }
+            if crate::runner::steer(&conversation, steer_text).await {
+                let _ = out.send(say(crate::busy::STEERING.to_string())).await;
+                return;
+            }
+        }
+
         // `!cmd`/`/cmd` headless commands answer inline via `gray cmd`;
         // they never enqueue a turn. The reply rides the outbound queue
         // (chunked to IRC's line limit) from a spawned task so a slow
         // command cannot stall the read loop.
-        if let Some((name, args)) = self.commands.parse(&self.config, &text, !chan) {
+        if let Some((name, args)) = self
+            .commands
+            .parse(&self.config, &text, !chan)
+            .filter(|_| steer.is_none())
+        {
             let out = out.clone();
             let commands = Arc::clone(&self.commands);
+            let pager = Arc::clone(&self.pager);
             let config = self.config.clone();
             let config_path = self.config_path.clone();
             let conversation = conversation.clone();
@@ -209,6 +244,12 @@ impl Daemon {
                     .await
                 {
                     crate::commands::Outcome::Text(reply) => {
+                        let reply = if name == "help" {
+                            format!("{reply}{}", crate::busy::help_suffix("!"))
+                        } else {
+                            reply
+                        };
+                        let reply = pager.first(&conversation, &reply);
                         let _ = out
                             .send(Out::Say {
                                 target,
@@ -251,9 +292,17 @@ impl Daemon {
             });
             return;
         }
-        if bang {
+        if bang && steer.is_none() {
             return;
         }
+        if steer.is_none()
+            && crate::busy::steer_mode(&self.config)
+            && crate::runner::steer(&conversation, &text).await
+        {
+            let _ = out.send(say(crate::busy::STEERING.to_string())).await;
+            return;
+        }
+        let text = steer.clone().unwrap_or(text);
 
         let capacity = self
             .config
@@ -264,7 +313,18 @@ impl Daemon {
             .store
             .enqueue(reply_target, sender, &conversation, &text, capacity)
         {
-            Ok(id) => eprintln!("[irc] queued {id} from {sender} in {reply_target}"),
+            Ok(id) => {
+                eprintln!("[irc] queued {id} from {sender} in {reply_target}");
+                if steer.is_some() {
+                    let _ = out.send(say(crate::busy::IDLE_STEER.to_string())).await;
+                } else if let Some(ack) = self.acks.queued(
+                    &conversation,
+                    self.store.ahead(&conversation, &id).unwrap_or(0),
+                    crate::store::now_secs(),
+                ) {
+                    let _ = out.send(say(ack)).await;
+                }
+            }
             Err(e) => {
                 let _ = out
                     .send(Out::Say {
@@ -340,8 +400,8 @@ impl Daemon {
                 }
             }
             Err(RunError::Busy) => {
-                self.store.requeue(&item.id)?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.store
+                    .requeue_busy(&item.id, crate::busy::BUSY_RETRY_SECS)?;
             }
             Err(e) => {
                 let note = if is_channel(&item.target) {
@@ -549,6 +609,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         store,
         out: std::sync::Mutex::new(None),
         commands: Arc::new(crate::commands::Commands::new()),
+        acks: crate::busy::Acks::default(),
+        pager: Arc::new(crate::busy::Pager::new(1200, 12, "!")),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted

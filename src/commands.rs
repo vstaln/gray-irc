@@ -252,6 +252,9 @@ fn registry_from(v: &Value) -> (BTreeMap<String, Scope>, BTreeSet<String>) {
         return (out, slow);
     };
     for c in commands {
+        if c["source"].as_str() == Some("skill") {
+            continue;
+        }
         let scope = if c["scope"].as_str() == Some("global") {
             Scope::Global
         } else {

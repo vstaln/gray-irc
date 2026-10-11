@@ -108,6 +108,12 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     int_in(data, "timeout_seconds", 1, 86400)?;
     int_in(data, "max_requests", 1, 1000)?;
     int_in(data, "queue_capacity", 1, 100000)?;
+    if data
+        .get("busy_input_mode")
+        .is_some_and(|v| !matches!(v.as_str(), Some("queue" | "steer")))
+    {
+        return Err("busy_input_mode must be queue or steer".to_string());
+    }
     int_in(data, "concurrency", 1, 16)?;
     for key in ["use_tls", "restart_notification"] {
         if let Some(t) = data.get(key) {
