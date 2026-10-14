@@ -329,7 +329,14 @@ fn ensure_home(config: &Value, config_path: &Path, conversation: &str) -> Result
             std::fs::read(Path::new(crate::irc::cfg_str(config, "gray_home")).join("config.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok());
-        if let Some(provider) = provider {
+        if let Some(mut provider) = provider {
+            if let Some(model) = config
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.trim().is_empty())
+            {
+                provider["model"] = Value::String(model.to_string());
+            }
             crate::config::atomic_json(&local_cfg, &provider)?;
         }
     }

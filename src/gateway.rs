@@ -420,9 +420,9 @@ impl Daemon {
             }
             Err(e) => {
                 let note = if is_channel(&item.target) {
-                    format!("{}: {e}", item.sender)
+                    format!("{}: {}", item.sender, e.failure_notice())
                 } else {
-                    e.to_string()
+                    e.failure_notice()
                 };
                 if let Some(out) = self.out_tx() {
                     let _ = out

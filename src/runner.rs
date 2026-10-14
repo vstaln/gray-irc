@@ -11,7 +11,7 @@ const LINE_CAP: usize = 1024 * 1024;
 #[derive(Debug, Clone)]
 pub enum RunError {
     Busy,
-    Timeout,
+    Timeout(u64),
     /// The turn used all `max_requests` provider requests and was stopped.
     RequestLimit(u64),
     Spawn(String),
@@ -19,6 +19,7 @@ pub enum RunError {
     Exit(Option<i32>),
     Incomplete,
     Empty,
+    Agent(String),
     Io(String),
 }
 
@@ -26,7 +27,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => f.write_str("This conversation is busy"),
-            Self::Timeout => f.write_str("gray turn timed out"),
+            Self::Timeout(_) => f.write_str("gray turn timed out"),
             Self::RequestLimit(n) => write!(f, "gray turn hit its {n}-request limit"),
             Self::Spawn(_) => f.write_str("cannot start gray agent"),
             Self::Protocol(_) => {
@@ -43,11 +44,60 @@ impl std::fmt::Display for RunError {
                 "Agent did not return a completed result; actions may already have occurred",
             ),
             Self::Empty => f.write_str("Agent returned no final answer"),
+            Self::Agent(text) => write!(f, "gray turn failed: {text}"),
             Self::Io(_) => f.write_str("gray turn failed; check connectivity"),
         }
     }
 }
 impl std::error::Error for RunError {}
+
+impl RunError {
+    pub fn failure_notice(&self) -> String {
+        let (head, reason) = match self {
+            Self::Busy => ("That failed", "this conversation is busy".to_string()),
+            Self::Timeout(secs) => (
+                "Gave up",
+                format!("the turn ran past its {} limit", limit_text(*secs)),
+            ),
+            Self::RequestLimit(n) => ("Gave up", format!("the turn hit its {n}-request limit")),
+            Self::Spawn(_) => ("That failed", "gray could not be run".to_string()),
+            Self::Protocol(_) => (
+                "That failed",
+                "gray's output format is not supported; upgrade gray".to_string(),
+            ),
+            Self::Exit(Some(n)) => ("That failed", format!("gray exited with code {n}")),
+            Self::Exit(None) => ("That failed", "gray exited without a status".to_string()),
+            Self::Incomplete => (
+                "That failed",
+                "gray stopped before it finished the answer".to_string(),
+            ),
+            Self::Empty => ("That failed", "gray returned no final answer".to_string()),
+            Self::Agent(text) | Self::Io(text) => ("That failed", text.clone()),
+        };
+        format!(
+            "{head}: {}. Some steps may already have run. Send a message to try again.",
+            plain(&reason)
+        )
+    }
+}
+
+fn limit_text(secs: u64) -> String {
+    if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn plain(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .chars()
+        .take(300)
+        .collect::<String>()
+        .trim_end_matches('.')
+        .to_string()
+}
 
 struct Consume {
     terminal: Option<Value>,
@@ -243,10 +293,17 @@ pub async fn run_gray(
         .get("gray_home")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
+    let mut provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| RunError::Io("gray provider configuration is missing".to_string()))?;
+    if let Some(model) = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        provider["model"] = Value::String(model.to_string());
+    }
     crate::config::atomic_json(&home.join("config.json"), &provider).map_err(RunError::Io)?;
 
     // Dedicated workdir/profile: the irc tools plus the minimal builtin
@@ -369,13 +426,15 @@ pub async fn run_gray(
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
         let Some(k_str) = k.to_str() else { continue };
-        if k_str.starts_with("GRAY_") || k_str.starts_with("IRC_") || k_str.starts_with("OPENAI_")
-        {
+        if k_str.starts_with("GRAY_") || k_str.starts_with("IRC_") || k_str.starts_with("OPENAI_") {
             continue;
         }
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    if !gray_home.is_empty() {
+        cmd.env("GRAY_USER_HOME", gray_home);
+    }
     cmd.env(
         "PATH",
         child_path(
@@ -414,7 +473,7 @@ pub async fn run_gray(
                 }
                 let _ = child.wait().await;
                 group.0 = 0;
-                return Err(RunError::Timeout);
+                return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child.wait().await;
@@ -428,6 +487,7 @@ pub async fn run_gray(
         if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
             return Err(RunError::RequestLimit(max_requests));
         }
+        return Err(RunError::Agent(agent_error_text(row)));
     }
     if !status.success() {
         return Err(RunError::Exit(status.code()));
@@ -455,6 +515,15 @@ pub async fn run_gray(
     // Drop the lock before the async state machine is suspended again.
     drop(_lock);
     answer
+}
+
+fn agent_error_text(row: &Value) -> String {
+    row["error"]["message"]
+        .as_str()
+        .or_else(|| row["message"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("gray reported an error")
+        .to_string()
 }
 
 /// Drain the child's NDJSON stdout: protocol 1 rows, one turn, terminal
