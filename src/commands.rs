@@ -369,13 +369,18 @@ async fn spawn_cmd(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
-    // Own process group so a timeout SIGKILL reaches grandchildren too.
+    // Own process group so a timeout kill reaches grandchildren too.
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
@@ -415,14 +420,9 @@ async fn spawn_cmd(
             return Err("Cannot read gray output.".to_string());
         }
         Err(_) => {
-            #[cfg(unix)]
             if pid != 0 {
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
+                crate::runner::kill_process_tree(pid);
             }
-            #[cfg(not(unix))]
-            let _ = child.kill().await;
             let _ = child.wait().await;
             return Err("That command timed out.".to_string());
         }
@@ -626,10 +626,13 @@ mod tests {
     }
 
     /// A stand-in `gray` binary: prints one fixture object like `cmd run`.
+    /// A `#!/bin/sh` script is spawnable only on unix; the Windows side has
+    /// no extensionless-script equivalent to stand in for the real binary.
+    #[cfg(unix)]
     fn fake_gray(dir: &Path, body: &str) -> PathBuf {
         use std::io::Write;
         #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt;
         let path = dir.join("gray");
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -642,6 +645,7 @@ use std::os::unix::fs::OpenOptionsExt;
         path
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_returns_text_and_scopes_home() {
         let dir = tempfile::tempdir().unwrap();
@@ -669,6 +673,7 @@ use std::os::unix::fs::OpenOptionsExt;
         assert!(home.is_dir());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_reports_garbage_output() {
         let dir = tempfile::tempdir().unwrap();
