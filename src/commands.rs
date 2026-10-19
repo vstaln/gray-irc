@@ -626,6 +626,9 @@ mod tests {
     }
 
     /// A stand-in `gray` binary: prints one fixture object like `cmd run`.
+    /// A `#!/bin/sh` script is spawnable only on unix; the Windows side has
+    /// no extensionless-script equivalent to stand in for the real binary.
+    #[cfg(unix)]
     fn fake_gray(dir: &Path, body: &str) -> PathBuf {
         use std::io::Write;
         #[cfg(unix)]
@@ -642,6 +645,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_returns_text_and_scopes_home() {
         let dir = tempfile::tempdir().unwrap();
@@ -669,6 +673,7 @@ mod tests {
         assert!(home.is_dir());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_reports_garbage_output() {
         let dir = tempfile::tempdir().unwrap();
