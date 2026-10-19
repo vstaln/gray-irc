@@ -8,6 +8,7 @@
 //! `local_only` server-side.
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -317,12 +318,19 @@ async fn fetch_registry(
 /// `gray cmd` just persisted (e.g. `/model`).
 fn ensure_home(config: &Value, config_path: &Path, conversation: &str) -> Result<PathBuf, String> {
     let home = crate::session::conversation_home(config_path, conversation);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        builder.mode(0o700);
+    }
+    builder
         .create(&home)
         .map_err(|_| "Cannot create the conversation home.".to_string())?;
-    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
     let local_cfg = home.join("config.json");
     if !local_cfg.exists() {
         let provider: Option<Value> =
@@ -362,6 +370,7 @@ async fn spawn_cmd(
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
     // Own process group so a timeout SIGKILL reaches grandchildren too.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -381,7 +390,7 @@ async fn spawn_cmd(
         "PATH",
         crate::runner::child_path(
             std::env::var_os("PATH"),
-            std::env::var_os("HOME").map(PathBuf::from),
+            crate::config::user_home(),
             Path::new(gray_bin),
         ),
     );
@@ -406,11 +415,14 @@ async fn spawn_cmd(
             return Err("Cannot read gray output.".to_string());
         }
         Err(_) => {
+            #[cfg(unix)]
             if pid != 0 {
                 unsafe {
                     libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
             }
+            #[cfg(not(unix))]
+            let _ = child.kill().await;
             let _ = child.wait().await;
             return Err("That command timed out.".to_string());
         }
@@ -616,15 +628,16 @@ mod tests {
     /// A stand-in `gray` binary: prints one fixture object like `cmd run`.
     fn fake_gray(dir: &Path, body: &str) -> PathBuf {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
         let path = dir.join("gray");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o755)
-            .open(&path)
-            .unwrap();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o755);
+        }
+        let mut f = opts.open(&path).unwrap();
         writeln!(f, "#!/bin/sh\nprintf '%s' '{body}'").unwrap();
         path
     }
