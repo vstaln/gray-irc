@@ -153,11 +153,9 @@ impl Store {
         self.conn
             .lock()
             .map_err(|_| "store locked".to_string())?
-            .query_row(
-                "SELECT COUNT(*) FROM inbox WHERE state='queued'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM inbox WHERE state='queued'", [], |r| {
+                r.get(0)
+            })
             .map_err(map_err)
     }
 
@@ -395,9 +393,7 @@ impl Store {
         self.conn
             .lock()
             .map_err(|_| "store locked".to_string())?
-            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),

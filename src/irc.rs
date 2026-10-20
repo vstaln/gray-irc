@@ -477,7 +477,10 @@ mod tests {
 
     #[test]
     fn markdown_gone() {
-        assert_eq!(strip_markdown("**bold** `code` [t](http://u)"), "bold code t (http://u)");
+        assert_eq!(
+            strip_markdown("**bold** `code` [t](http://u)"),
+            "bold code t (http://u)"
+        );
         assert_eq!(strip_markdown("```rust\ncode\n```"), "code");
     }
 

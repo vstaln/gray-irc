@@ -161,7 +161,6 @@ pub(crate) fn kill_process_tree(pid: u32) {
         .status();
 }
 
-
 #[cfg(windows)]
 struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
 
@@ -594,8 +593,7 @@ exec {} sidecar --config {}
                 if pid != 0 {
                     kill_process_tree(pid);
                 }
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
                 group.disarm();
                 return Err(RunError::Timeout(timeout_secs));
             }

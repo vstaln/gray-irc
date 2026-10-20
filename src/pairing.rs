@@ -60,7 +60,9 @@ pub fn reply_for(store: &crate::store::Store, nick: &str, dm: bool) -> Option<Pa
 /// rewritten privately (0600) exactly as the wizard would.
 pub fn approve(config_path: &Path, platform: &str, code: &str) -> Result<String, String> {
     if platform != "irc" {
-        return Err(format!("unknown platform '{platform}'; the only one is irc"));
+        return Err(format!(
+            "unknown platform '{platform}'; the only one is irc"
+        ));
     }
     let store = crate::gateway::open_store(config_path)?;
     let nick = store

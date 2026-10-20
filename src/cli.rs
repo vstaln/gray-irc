@@ -195,7 +195,10 @@ fn queue(action: &QueueAction, config_path: &Path) -> Result<(), String> {
             }
             for i in items {
                 let text: String = i.text.chars().take(24).collect();
-                println!("{} [{}] {} {} ({}…)", i.id, i.state, i.target, i.sender, text);
+                println!(
+                    "{} [{}] {} {} ({}…)",
+                    i.id, i.state, i.target, i.sender, text
+                );
             }
             Ok(())
         }
@@ -306,9 +309,7 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                         println!("For operation after logout: loginctl enable-linger \"$USER\"");
                     }
                 } else {
-                    println!(
-                        "Run gray irc install when ready, or gray irc run in the foreground."
-                    );
+                    println!("Run gray irc install when ready, or gray irc run in the foreground.");
                 }
             }
             Ok(())
