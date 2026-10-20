@@ -161,7 +161,6 @@ pub(crate) fn kill_process_tree(pid: u32) {
         .status();
 }
 
-
 #[cfg(windows)]
 struct JobGuard(windows_sys::Win32::Foundation::HANDLE);
 
@@ -403,8 +402,13 @@ pub async fn run_gray(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
     }
+    // A reinstall under the running service reads as "<path> (deleted)";
+    // the launcher must exec the replacement at <path>.
     let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            let p = p.to_string_lossy();
+            p.strip_suffix(" (deleted)").unwrap_or(&p).to_string()
+        })
         .unwrap_or_else(|_| "gray-irc".to_string());
     let abs_config = config_path
         .to_str()
@@ -589,8 +593,7 @@ exec {} sidecar --config {}
                 if pid != 0 {
                     kill_process_tree(pid);
                 }
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
                 group.disarm();
                 return Err(RunError::Timeout(timeout_secs));
             }

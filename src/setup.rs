@@ -298,9 +298,7 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
 
     let nickname = io.prompt("Bot nickname (e.g. gray-bot): ")?;
     let nickname = nickname.trim().to_string();
-    if nickname.is_empty()
-        || nickname.len() > 30
-        || !nickname.bytes().all(|b| b.is_ascii_graphic())
+    if nickname.is_empty() || nickname.len() > 30 || !nickname.bytes().all(|b| b.is_ascii_graphic())
     {
         return Err("Nickname must be 1-30 non-space characters".to_string());
     }
@@ -308,9 +306,10 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
     let channels_answer = io.prompt("Channels to join, comma-separated (e.g. #gray): ")?;
     let channels = csv(&channels_answer);
     if channels.is_empty()
-        || !channels
-            .iter()
-            .all(|c| crate::config::target_valid(&Value::String(c.clone())) && c.starts_with(['#', '&', '+', '!']))
+        || !channels.iter().all(|c| {
+            crate::config::target_valid(&Value::String(c.clone()))
+                && c.starts_with(['#', '&', '+', '!'])
+        })
     {
         return Err("Channels must be IRC channel names (#chan), comma-separated".to_string());
     }
