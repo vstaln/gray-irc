@@ -11,6 +11,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
+        "description": "join IRC channels and post to them",
         "commands": [],
         "hooks": ["prompt/context"],
         "tools": [{
